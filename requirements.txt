@@ -1,0 +1,6 @@
+eegdash>=0.3.8
+braindecode
+jupyter
+lightning
+ipykernel
+torch==2.7.1
