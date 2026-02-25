@@ -103,7 +103,6 @@ BASELINE_MODELS = [
     "EEGTCNet",
     "EEGConformer",
     "EEGTransformer",
-    "EEGformer",
     "DualTSST",
     "MoCoEEG",
     "STTCNN",

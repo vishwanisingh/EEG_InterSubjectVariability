@@ -12,14 +12,18 @@
 
 set -euo pipefail
 
+# ── SLURM vars — provide defaults so the script also runs locally ─────────────
+JOB_ID="${SLURM_JOB_ID:-local}"
+NODE="${SLURMD_NODENAME:-$(hostname)}"
+SUBMIT_DIR="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "$0")" && pwd)}"
+
 echo "============================================================"
-echo "Job ID     : $SLURM_JOB_ID"
-echo "Node       : $SLURMD_NODENAME"
+echo "Job ID     : $JOB_ID"
+echo "Node       : $NODE"
 echo "Start time : $(date)"
 echo "============================================================"
 
 # ── Activate conda env ───────────────────────────────────────────────────────
-# Try loading a module first (common on HPC clusters)
 if command -v module &>/dev/null; then
     module load miniconda3 2>/dev/null \
         || module load anaconda3 2>/dev/null \
@@ -35,26 +39,26 @@ echo "Python : $(which python)"
 echo "Torch  : $(python -c 'import torch; print(torch.__version__)')"
 echo "CUDA   : $(python -c 'import torch; print(torch.cuda.is_available())')"
 
-# ── Move to project root ─────────────────────────────────────────────────────
-cd "$SLURM_SUBMIT_DIR"
+# ── Move to project root ──────────────────────────────────────────────────────
+cd "$SUBMIT_DIR"
 mkdir -p logs results weights data
 
-# ── Step 1: Prepare data ─────────────────────────────────────────────────────
-echo ""
-echo "============================================================"
-echo "STEP 1/2 — Preparing data"
-echo "============================================================"
+# ── Step 1: Prepare data ──────────────────────────────────────────────────────
+# echo ""
+# echo "============================================================"
+# echo "STEP 1/2 — Preparing data"
+# echo "============================================================"
 
-python create_and_save_splits.py
+# python prepare_data.py
 
-if [ $? -ne 0 ]; then
-    echo "ERROR: Data preparation failed. Aborting."
-    exit 1
-fi
+# if [ $? -ne 0 ]; then
+#     echo "ERROR: Data preparation failed. Aborting."
+#     exit 1
+# fi
 
-echo "Data preparation complete."
+# echo "Data preparation complete."
 
-# ── Step 2: Run baselines ────────────────────────────────────────────────────
+# ── Step 2: Run baselines ─────────────────────────────────────────────────────
 echo ""
 echo "============================================================"
 echo "STEP 2/2 — Running baseline models"

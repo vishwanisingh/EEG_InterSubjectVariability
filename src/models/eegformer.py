@@ -115,9 +115,9 @@ class EEGformer(nn.Module):
         n_outputs: int = 1,
         n_times: int = 200,
         sfreq: int = 100,
-        d_model: int = 64,
+        d_model: int = 32,
         n_heads: int = 4,
-        n_layers: int = 3,
+        n_layers: int = 2,
         dropout: float = 0.1,
     ):
         super().__init__()

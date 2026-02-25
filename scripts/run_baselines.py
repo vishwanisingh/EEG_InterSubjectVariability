@@ -196,7 +196,7 @@ def main() -> None:
     # ── [3/4] Data loaders ────────────────────────────────────────────────────
     print("\n[3/4] Creating data loaders...")
     train_loader = DataLoader(
-        train_set, batch_size=BATCH_SIZE, shuffle=True,  num_workers=NUM_WORKERS,
+        train_set, batch_size=BATCH_SIZE, shuffle=True,  num_workers=NUM_WORKERS, drop_last=True,
     )
     valid_loader = DataLoader(
         valid_set, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS,
