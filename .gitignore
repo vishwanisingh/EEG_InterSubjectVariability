@@ -4,3 +4,4 @@ __pycache__/
 .eegdash_cache/
 results/
 weights/
+*.pdf

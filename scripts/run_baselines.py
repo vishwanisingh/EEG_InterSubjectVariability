@@ -1,154 +1,206 @@
-"""
-scripts/run_baselines.py
-------------------------
-Train all baseline models sequentially on the pre-saved windowed dataset
-and write a comparison CSV.
-
-Run prepare_data.py first if the windowed dataset doesn't exist yet.
-
-Usage:
-    python scripts/run_baselines.py
-"""
+"""Run all baseline models on the EEG dataset."""
 
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+# Add parent directory to path
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import torch
 from torch.utils.data import DataLoader
-from sklearn.model_selection import train_test_split
-from sklearn.utils import check_random_state
 
-from configs.config import (
-    TASK, RELEASE, WINDOWS_DIR, RESULTS_DIR, WEIGHTS_DIR,
-    BATCH_SIZE, NUM_WORKERS,
-    N_CHANS, N_OUTPUTS, N_TIMES, SFREQ,
-    N_EPOCHS, LEARNING_RATE, WEIGHT_DECAY, PATIENCE, MIN_DELTA,
-    VALID_FRAC, TEST_FRAC, SEED, EXCLUDED_SUBJECTS,
+from src import (
+    load_eegdash_dataset,
+    preprocess_dataset,
+    create_windows,
+    split_by_subjects,
+    create_model,
+    train_model,
+    save_results_to_csv,
+    save_model_weights,
+    plot_training_history,
+    plot_response_time_distribution,
+    setup_device,
 )
-from src.data.disk_dataset import load_windowed_dataset
-from src.models.registry import create_model, get_baseline_models
-from src.training.trainer import train_model
-from src.training.engine import validate_model
-from src.utils.device import setup_device
-from src.utils.io import save_results_to_csv, save_model_weights
-from src.utils.plotting import plot_training_history
+from experiments.baseline_configs import (
+    DATA_CONFIG,
+    PREPROCESS_CONFIG,
+    WINDOW_CONFIG,
+    SPLIT_CONFIG,
+    DATALOADER_CONFIG,
+    MODEL_CONFIG,
+    TRAINING_CONFIG,
+    BASELINE_MODELS,
+    OUTPUT_CONFIG,
+)
 
 
-def run_baselines() -> None:
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    WEIGHTS_DIR.mkdir(parents=True, exist_ok=True)
-
-    device   = setup_device()
-    root_dir = WINDOWS_DIR / f"{TASK}_{RELEASE}"
-
-    # ── Load dataset from disk ────────────────────────────────────────────────
-    print(f"\nLoading windowed dataset from {root_dir} ...")
-    dataset = load_windowed_dataset(
-        root_dir=root_dir,
-        target_key="target",
-        eager=False,
-        excluded_subjects=EXCLUDED_SUBJECTS,
-    )
-
-    # ── Split subjects ────────────────────────────────────────────────────────
-    all_subjects = dataset.get_subject_ids()
-
-    train_valid, test_subj = train_test_split(
-        all_subjects,
-        test_size=TEST_FRAC,
-        random_state=check_random_state(SEED),
-        shuffle=True,
-    )
-    adjusted_valid = VALID_FRAC / (1.0 - TEST_FRAC)
-    train_subj, valid_subj = train_test_split(
-        train_valid,
-        test_size=adjusted_valid,
-        random_state=check_random_state(SEED + 1),
-        shuffle=True,
-    )
-
-    train_set, valid_set, test_set = dataset.split_by_subjects(
-        train_subj, valid_subj, test_subj
-    )
-
-    print(f"  Train : {len(train_set)} windows  ({len(train_subj)} subjects)")
-    print(f"  Valid : {len(valid_set)} windows  ({len(valid_subj)} subjects)")
-    print(f"  Test  : {len(test_set)} windows  ({len(test_subj)} subjects)")
-
-    # ── Data loaders — created once, reused for all models ───────────────────
-    train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True,  num_workers=NUM_WORKERS)
-    valid_loader = DataLoader(valid_set, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS)
-    test_loader  = DataLoader(test_set,  batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS)
-
-    # ── Train each baseline ───────────────────────────────────────────────────
-    baselines = get_baseline_models()
-    print(f"\nRunning {len(baselines)} baseline models: {baselines}\n")
-
-    summary = []
-
-    for i, model_name in enumerate(baselines, 1):
-        print(f"\n{'#'*70}")
-        print(f"  Baseline {i}/{len(baselines)}: {model_name}")
-        print(f"{'#'*70}")
-
-        try:
-            model = create_model(
-                model_name, n_chans=N_CHANS, n_outputs=N_OUTPUTS,
-                n_times=N_TIMES, sfreq=SFREQ,
-            )
-            model.to(device)
-            print(f"  Parameters: {sum(p.numel() for p in model.parameters()):,}")
-
-            results = train_model(
-                model=model,
-                train_loader=train_loader,
-                val_loader=valid_loader,
-                device=device,
-                n_epochs=N_EPOCHS,
-                lr=LEARNING_RATE,
-                weight_decay=WEIGHT_DECAY,
-                patience=PATIENCE,
-                min_delta=MIN_DELTA,
-                print_stats=True,
-            )
-
-            _, test_rmse = validate_model(
-                test_loader, model, torch.nn.MSELoss(), device, print_batch_stats=False
-            )
-            results["test_rmse"] = test_rmse
-
-            save_results_to_csv(
-                results, RESULTS_DIR / "baseline_results.csv", model_name=model_name
-            )
-            save_model_weights(results["best_model_state"], model_name, WEIGHTS_DIR)
-            plot_training_history(
-                results["train_history"], results["val_history"], model_name, RESULTS_DIR
-            )
-
-            print(f"  → Best val RMSE : {results['best_val_rmse']:.6f}  "
-                  f"Test RMSE : {test_rmse:.6f}")
-            summary.append((model_name, results["best_val_rmse"], test_rmse, "✓"))
-
-        except Exception as exc:
-            print(f"  ✗ {model_name} failed: {exc}")
-            summary.append((model_name, None, None, f"✗ {exc}"))
-            continue
-
-    # ── Final summary table ───────────────────────────────────────────────────
+def run_single_baseline(
+    model_name: str,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    test_loader: DataLoader,
+    device: torch.device,
+) -> None:
+    """
+    Run training for a single baseline model.
+    """
     print(f"\n{'='*70}")
-    print("BASELINE SUMMARY")
-    print(f"{'='*70}")
-    print(f"  {'Model':<25} {'Val RMSE':>10} {'Test RMSE':>10}  Status")
-    print(f"  {'-'*25} {'-'*10} {'-'*10}  ------")
-    for model_name, val_rmse, test_rmse, status in summary:
-        val_str  = f"{val_rmse:.6f}"  if val_rmse  is not None else "—"
-        test_str = f"{test_rmse:.6f}" if test_rmse is not None else "—"
-        print(f"  {model_name:<25} {val_str:>10} {test_str:>10}  {status}")
-    print(f"{'='*70}")
-    print(f"\n✓ Results saved to {RESULTS_DIR / 'baseline_results.csv'}")
+    print(f"Training {model_name}")
+    print('='*70)
+
+    # Create model
+    try:
+        model = create_model(model_name, **MODEL_CONFIG)
+        model.to(device)
+        n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"\n{model_name} architecture:")
+        print(model)
+        print(f"\nTrainable parameters: {n_params:,}  ({n_params/1e6:.3f} M)")
+    except Exception as e:
+        print(f"Error creating model {model_name}: {e}")
+        return
+
+    # Train model
+    try:
+        results = train_model(
+            model=model,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            device=device,
+            **TRAINING_CONFIG,
+        )
+
+        # Evaluate on test set (RMSE + MAE + R2)
+        from src.training import validate_model
+        test_metrics = validate_model(
+            test_loader,
+            model,
+            torch.nn.MSELoss(),
+            device,
+            print_batch_stats=True,
+        )
+        results["test_rmse"] = test_metrics["rmse"]
+        results["test_mae"]  = test_metrics["mae"]
+        results["test_r2"]   = test_metrics["r2"]
+
+        print(f"\n{'='*70}")
+        print(f"{model_name} - Final Results:")
+        print(f"  Val  RMSE : {results['best_val_rmse']:.6f}  "
+              f"MAE: {results['best_val_mae']:.6f}  R2: {results['best_val_r2']:.4f}  "
+              f"(epoch {results['best_epoch']})")
+        print(f"  Test RMSE : {results['test_rmse']:.6f}  "
+              f"MAE: {results['test_mae']:.6f}  R2: {results['test_r2']:.4f}")
+        print(f"  Train time: {results['train_time_s']:.1f} s")
+        print(f"  Params    : {n_params/1e6:.3f} M")
+        print('='*70)
+
+        # Save results
+        save_results_to_csv(
+            results,
+            OUTPUT_CONFIG["results_csv"],
+            model_name=model_name,
+            n_params=n_params,
+        )
+
+        # Save model weights
+        save_model_weights(
+            results["best_model_state"],
+            model_name,
+            OUTPUT_CONFIG["weights_dir"],
+        )
+
+        # Plot training history
+        plot_training_history(
+            results["train_history"],
+            results["val_history"],
+            model_name,
+            OUTPUT_CONFIG["results_dir"],
+        )
+
+    except Exception as e:
+        print(f"Error training model {model_name}: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+def main():
+    """Main function to run all baselines."""
+    print("="*70)
+    print("EEG BASELINE MODELS TRAINING")
+    print("="*70)
+    
+    # Setup device
+    device = setup_device()
+    
+    # Load dataset
+    print("\n[1/6] Loading dataset...")
+    dataset = load_eegdash_dataset(**DATA_CONFIG)
+    print(f"Loaded {len(dataset)} recordings")
+    
+    # Preprocess dataset
+    print("\n[2/6] Preprocessing dataset...")
+    dataset = preprocess_dataset(dataset, **PREPROCESS_CONFIG)
+    
+    # Create windows
+    print("\n[3/6] Creating windows...")
+    windowed_dataset = create_windows(dataset, **WINDOW_CONFIG)
+    print(f"Created {len(windowed_dataset)} windows")
+    
+    # Plot response time distribution
+    metadata = windowed_dataset.get_metadata()
+    plot_response_time_distribution(
+        metadata,
+        OUTPUT_CONFIG["results_dir"] / "response_time_distribution.png"
+    )
+    
+    # Split dataset
+    print("\n[4/6] Splitting dataset...")
+    train_set, valid_set, test_set = split_by_subjects(
+        windowed_dataset,
+        **SPLIT_CONFIG,
+    )
+    
+    # Create data loaders
+    print("\n[5/6] Creating data loaders...")
+    train_loader = DataLoader(
+        train_set,
+        batch_size=DATALOADER_CONFIG["batch_size"],
+        shuffle=True,
+        num_workers=DATALOADER_CONFIG["num_workers"],
+    )
+    valid_loader = DataLoader(
+        valid_set,
+        batch_size=DATALOADER_CONFIG["batch_size"],
+        shuffle=False,
+        num_workers=DATALOADER_CONFIG["num_workers"],
+    )
+    test_loader = DataLoader(
+        test_set,
+        batch_size=DATALOADER_CONFIG["batch_size"],
+        shuffle=False,
+        num_workers=DATALOADER_CONFIG["num_workers"],
+    )
+    
+    # Train all baseline models
+    print("\n[6/6] Training baseline models...")
+    for i, model_name in enumerate(BASELINE_MODELS, 1):
+        print(f"\n\nBaseline {i}/{len(BASELINE_MODELS)}: {model_name}")
+        run_single_baseline(
+            model_name=model_name,
+            train_loader=train_loader,
+            val_loader=valid_loader,
+            test_loader=test_loader,
+            device=device,
+        )
+    
+    print("\n" + "="*70)
+    print("ALL BASELINES COMPLETED!")
+    print("="*70)
+    print(f"\nResults saved to: {OUTPUT_CONFIG['results_csv']}")
+    print(f"Model weights saved to: {OUTPUT_CONFIG['weights_dir']}")
+    print(f"Plots saved to: {OUTPUT_CONFIG['results_dir']}")
 
 
 if __name__ == "__main__":
-    run_baselines()
+    main()
