@@ -57,15 +57,15 @@ def load_pretrained_encoder(method: str, embed_dim: int) -> EEGEncoder:
             f"Run: python scripts/ssl_pretrain.py --method {method}"
         )
 
-    encoder = EEGEncoder(n_chans=N_CHANS, n_times=N_TIMES, embed_dim=embed_dim)
-
     # MAE uses a different encoder class
     if method == "mae":
         mae = EEGMaskedAutoencoder(n_chans=N_CHANS, n_times=N_TIMES,
                                    encoder_d_model=embed_dim)
         mae.encoder.load_state_dict(torch.load(ckpt_path, map_location="cpu"))
+        print(f"  ✓ Loaded pretrained MAE encoder from {ckpt_path}")
         return mae.encoder
 
+    encoder = EEGEncoder(n_chans=N_CHANS, n_times=N_TIMES, embed_dim=embed_dim)
     encoder.load_state_dict(torch.load(ckpt_path, map_location="cpu"))
     print(f"  ✓ Loaded pretrained encoder from {ckpt_path}")
     return encoder
@@ -142,8 +142,8 @@ def finetune(
         model_name = f"SSL_{method.upper()}_{finetune_mode}"
 
     model.to(device)
-    total    = sum(p.numel() for p in model.parameters())
-    trainable= sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total     = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"  Parameters: {trainable:,} trainable / {total:,} total")
 
     # ── [4/5] Fine-tune ───────────────────────────────────────────────────────
@@ -162,17 +162,20 @@ def finetune(
     )
 
     # ── [5/5] Evaluate + save ─────────────────────────────────────────────────
-    test_loss, test_rmse = validate_model(
+    # validate_model returns a dict: {avg_loss, rmse, mae, r2}
+    test_metrics = validate_model(
         test_loader, model, torch.nn.MSELoss(), device, print_batch_stats=False
     )
-    results["test_rmse"] = test_rmse
-    results["test_loss"] = test_loss
+    results["test_rmse"] = test_metrics["rmse"]
+    results["test_mae"]  = test_metrics["mae"]
+    results["test_r2"]   = test_metrics["r2"]
 
     print(f"\n{'='*60}")
     print(f"RESULTS: {model_name}")
     print(f"  Best Val RMSE : {results['best_val_rmse']:.6f}  (epoch {results['best_epoch']})")
-    print(f"  Test RMSE     : {test_rmse:.6f}")
-    print("="*60)
+    print(f"  Test RMSE     : {results['test_rmse']:.6f}  "
+          f"MAE: {results['test_mae']:.6f}  R2: {results['test_r2']:.4f}")
+    print("=" * 60)
 
     save_results_to_csv(results, RESULTS_DIR / "ssl_results.csv", model_name=model_name)
     save_model_weights(results["best_model_state"], model_name, WEIGHTS_DIR)

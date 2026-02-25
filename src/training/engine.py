@@ -1,6 +1,6 @@
 """Low-level training and validation loop functions."""
 
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import torch
 from torch.nn import Module
@@ -80,7 +80,7 @@ def validate_model(
     print_batch_stats: bool = True,
 ) -> Dict[str, float]:
     """
-    Evaluate model -- returns RMSE, MAE, and R2.
+    Evaluate model — returns avg_loss, RMSE, MAE, and R².
 
     Returns
     -------
@@ -132,7 +132,7 @@ def validate_model(
     rmse     = (sum_sq_err / max(n_samples, 1)) ** 0.5
     mae      = sum_abs_err / max(n_samples, 1)
 
-    # R2 = 1 - SS_res / SS_tot
+    # R² = 1 - SS_res / SS_tot
     all_targets_t = torch.cat(all_targets)
     all_preds_t   = torch.cat(all_preds)
     ss_res = torch.sum((all_targets_t - all_preds_t) ** 2).item()
