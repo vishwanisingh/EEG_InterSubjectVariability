@@ -49,7 +49,7 @@ mkdir -p logs results weights data
 # echo "STEP 1/2 — Preparing data"
 # echo "============================================================"
 
-# python prepare_data.py
+# python prepare_ccd_data.py
 
 # if [ $? -ne 0 ]; then
 #     echo "ERROR: Data preparation failed. Aborting."

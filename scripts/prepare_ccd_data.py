@@ -1,5 +1,5 @@
 """
-scripts/prepare_data.py
+scripts/prepare_ccd_data.py
 -----------------------
 Run ONCE to download, preprocess, window, and save the dataset to disk.
 
@@ -17,7 +17,7 @@ On-disk layout:
             metadata.npz          mixed    target, rt, correct, subject, ...
 
 Usage:
-    python scripts/prepare_data.py
+    python scripts/prepare_ccd_data.py
 """
 
 import gc

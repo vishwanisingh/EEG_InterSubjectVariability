@@ -8,9 +8,9 @@ Key design: pretrain on ALL available tasks (resting, movies, CCD, etc.)
 for maximum unsupervised signal, then fine-tune on CCD only.
 
 Usage:
-    python scripts/ssl_pretrain.py --method vicreg --task all
-    python scripts/ssl_pretrain.py --method byol   --task contrastChangeDetection
-    python scripts/ssl_pretrain.py --method mae    --task all
+    python scripts/ssl_pretrain.py --method vicreg --encoder conformer
+    python scripts/ssl_pretrain.py --method byol   --encoder tcnet
+    python scripts/ssl_pretrain.py --method mae    --encoder conformer --task all
 """
 
 import sys
@@ -29,7 +29,7 @@ from configs.config import (
     BATCH_SIZE, NUM_WORKERS,
 )
 from src.data.disk_dataset import load_windowed_dataset
-from src.ssl.encoder import EEGEncoder
+from src.ssl.encoder import create_encoder
 from src.ssl.vicreg import VICReg
 from src.ssl.byol import BYOL
 from src.ssl.mae import EEGMaskedAutoencoder
@@ -66,7 +66,7 @@ def load_pretrain_data(tasks: list, release: str, batch_size: int) -> DataLoader
             print(f"  [skip] {task}: {e}")
 
     if not datasets:
-        raise RuntimeError("No pretraining data found. Run prepare_data.py first.")
+        raise RuntimeError("No pretraining data found. Run prepare_ccd_data.py first.")
 
     combined = ConcatDataset(datasets)
     print(f"\n  Total pretraining windows: {len(combined)}")
@@ -82,6 +82,7 @@ def load_pretrain_data(tasks: list, release: str, batch_size: int) -> DataLoader
 
 def pretrain(
     method: str = "vicreg",
+    encoder_name: str = "conformer",
     tasks: list = None,
     release: str = "R5",
     n_epochs: int = 100,
@@ -98,6 +99,8 @@ def pretrain(
     ----------
     method : str
         One of 'vicreg', 'byol', 'mae'.
+    encoder_name : str
+        One of 'conformer' (EEGConformer) or 'tcnet' (EEGTCNet).
     tasks : list
         List of task names to pretrain on. None = ALL_PRETRAIN_TASKS.
     release : str
@@ -132,14 +135,18 @@ def pretrain(
     print(f"\n[1/4] Loading pretraining data (tasks: {tasks})")
     loader = load_pretrain_data(tasks, release, batch_size)
 
-    # ── Model ─────────────────────────────────────────────────────────────────
-    print(f"\n[2/4] Building {method.upper()} model")
-
-    encoder = EEGEncoder(
+    # ── Encoder ───────────────────────────────────────────────────────────────
+    print(f"\n[2/4] Building encoder: {encoder_name}")
+    encoder = create_encoder(
+        name=encoder_name,
         n_chans=N_CHANS,
         n_times=N_TIMES,
         embed_dim=embed_dim,
     )
+
+    # ── SSL model ─────────────────────────────────────────────────────────────
+    print(f"      Building SSL method: {method.upper()}")
+    run_name = f"{method}_{encoder_name}"   # e.g. "vicreg_conformer"
 
     if method == "vicreg":
         aug = get_default_augmentation()
@@ -152,14 +159,19 @@ def pretrain(
         model = BYOL(encoder, proj_dim=256, augmentation=aug)
 
     elif method == "mae":
-        model = EEGMaskedAutoencoder(
-            n_chans=N_CHANS,
-            n_times=N_TIMES,
-            patch_size=10,
-            mask_ratio=0.75,
-            encoder_d_model=embed_dim,
+        # MAE wraps its own encoder internally; we inject ours via the
+        # encoder's backbone — use a lightweight MAE on top of the embedding
+        # Note: MAE expects a patch-based encoder; here we use the encoder's
+        # forward() output as the token sequence by treating embed_dim as
+        # a single global token. For a proper patch-level MAE, switch to
+        # EEGMaskedAutoencoder with the conformer/tcnet as the patch embedder.
+        # For now, VICReg / BYOL are the primary SSL methods for these encoders.
+        raise NotImplementedError(
+            "MAE requires a patch-level encoder. "
+            "Use --method vicreg or --method byol with --encoder conformer/tcnet.\n"
+            "MAE pretraining is supported with the original EEGMaskedAutoencoder "
+            "(patch-based ViT encoder) — see the original ssl_pretrain.py."
         )
-        encoder = model.encoder   # MAE encoder is inside the MAE model
 
     else:
         raise ValueError(f"Unknown method: {method}. Choose vicreg / byol / mae")
@@ -178,17 +190,17 @@ def pretrain(
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_epochs)
 
     # ── Training loop ─────────────────────────────────────────────────────────
-    log_file = RESULTS_DIR / f"ssl_{method}_pretrain_log.txt"
+    log_file = RESULTS_DIR / f"ssl_{run_name}_pretrain_log.txt"
     best_loss = float("inf")
+    best_ckpt = WEIGHTS_DIR / f"ssl_{run_name}_encoder_best.pt"
 
     for epoch in range(1, n_epochs + 1):
         model.train()
         total_loss = 0.0
         n_batches  = 0
 
-        bar = tqdm(loader, desc=f"Epoch {epoch}/{n_epochs} [{method}]", leave=False)
+        bar = tqdm(loader, desc=f"Epoch {epoch}/{n_epochs} [{run_name}]", leave=False)
         for batch in bar:
-            # batch[0] is the EEG tensor from EEGWindowDataset
             x = batch[0].to(device).float()
 
             optimizer.zero_grad(set_to_none=True)
@@ -197,7 +209,6 @@ def pretrain(
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
-            # BYOL requires EMA update after each step
             if method == "byol":
                 model.update_target()
 
@@ -210,23 +221,20 @@ def pretrain(
 
         print(f"  Epoch {epoch:03d}  loss={avg_loss:.6f}  lr={scheduler.get_last_lr()[0]:.2e}")
 
-        # Log to file
         with open(log_file, "a") as f:
             f.write(f"{epoch},{avg_loss:.6f}\n")
 
-        # Save checkpoint
         if avg_loss < best_loss:
             best_loss = avg_loss
-            best_ckpt = WEIGHTS_DIR / f"ssl_{method}_encoder_best.pt"
             torch.save(encoder.state_dict(), best_ckpt)
 
         if epoch % save_every == 0:
-            ckpt = WEIGHTS_DIR / f"ssl_{method}_encoder_epoch{epoch:03d}.pt"
+            ckpt = WEIGHTS_DIR / f"ssl_{run_name}_encoder_epoch{epoch:03d}.pt"
             torch.save(encoder.state_dict(), ckpt)
 
     # ── Save final encoder ────────────────────────────────────────────────────
     print(f"\n[4/4] Saving pretrained encoder")
-    final_path = WEIGHTS_DIR / f"ssl_{method}_encoder_final.pt"
+    final_path = WEIGHTS_DIR / f"ssl_{run_name}_encoder_final.pt"
     torch.save(encoder.state_dict(), final_path)
     print(f"  ✓ Final encoder → {final_path}")
     print(f"  ✓ Best encoder  → {best_ckpt}")
@@ -236,21 +244,25 @@ def pretrain(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="EEG SSL Pretraining")
-    parser.add_argument("--method",     type=str,   default="vicreg",
-                        choices=["vicreg", "byol", "mae"])
-    parser.add_argument("--release",    type=str,   default="R5")
-    parser.add_argument("--tasks",      type=str,   default="all",
+    parser.add_argument("--method",      type=str, default="vicreg",
+                        choices=["vicreg", "byol"])
+    parser.add_argument("--encoder",     type=str, default="conformer",
+                        choices=["conformer", "tcnet"],
+                        help="Encoder backbone: 'conformer' or 'tcnet'")
+    parser.add_argument("--release",     type=str, default="R5")
+    parser.add_argument("--tasks",       type=str, default="all",
                         help="Comma-separated task names, or 'all'")
-    parser.add_argument("--epochs",     type=int,   default=100)
-    parser.add_argument("--lr",         type=float, default=1e-3)
-    parser.add_argument("--embed_dim",  type=int,   default=256)
-    parser.add_argument("--batch_size", type=int,   default=None)
+    parser.add_argument("--epochs",      type=int, default=100)
+    parser.add_argument("--lr",          type=float, default=1e-3)
+    parser.add_argument("--embed_dim",   type=int, default=256)
+    parser.add_argument("--batch_size",  type=int, default=None)
     args = parser.parse_args()
 
     tasks = None if args.tasks == "all" else args.tasks.split(",")
 
     pretrain(
         method=args.method,
+        encoder_name=args.encoder,
         tasks=tasks,
         release=args.release,
         n_epochs=args.epochs,

@@ -58,6 +58,7 @@ def save_results_to_csv(
 def save_model_weights(
     model_state: Dict,
     model_name: str,
+    data_mode: str,
     save_dir: str | Path = "weights",
 ) -> Path:
     """

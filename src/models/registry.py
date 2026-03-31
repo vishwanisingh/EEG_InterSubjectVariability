@@ -43,11 +43,6 @@ from braindecode.models import (
 )
 
 # ── custom models ─────────────────────────────────────────────────────────────
-from .eeg_transformer import EEGTransformer
-from .eegformer import EEGformer
-from .dual_tsst import DualTSST
-from .moco_eeg import MoCoEEG
-from .st_tcnn import STTCNN
 from .eeg_unified import EEGUnifiedModel
 
 
@@ -57,13 +52,13 @@ MODEL_REGISTRY = {
     "BDTCN":                  BDTCN,
     "ContraWR":               ContraWR,
     "Deep4Net":               Deep4Net,
-    "EEGConformer":           EEGConformer,    # ← EEG Conformer
+    "EEGConformer":           EEGConformer,
     "EEGITNet":               EEGITNet,
     "EEGInceptionERP":        EEGInceptionERP,
     "EEGNeX":                 EEGNeX,
     "EEGNet":                 EEGNet,
     "EEGSimpleConv":          EEGSimpleConv,
-    "EEGTCNet":               EEGTCNet,        # ← EEG-TCNet
+    "EEGTCNet":               EEGTCNet,
     "FBCNet":                 FBCNet,
     "IFNet":                  IFNet,
     "SCCNet":                 SCCNet,
@@ -74,11 +69,6 @@ MODEL_REGISTRY = {
     "SyncNet":                SyncNet,
     "TSception":              TSception,
     # ── custom models ─────────────────────────────────────────────────────────
-    "EEGTransformer":         EEGTransformer,  # ← EEG-Transformer
-    "EEGformer":              EEGformer,       # ← EEGformer
-    "DualTSST":               DualTSST,        # ← Dual-TSST
-    "MoCoEEG":                MoCoEEG,         # ← MoCo-EEG
-    "STTCNN":                 STTCNN,          # ← ST-TCNN
     "EEGUnifiedModel":        EEGUnifiedModel,
 }
 
@@ -88,12 +78,7 @@ YOUR_MODEL_MAP = {
     "Deep4Net":         "Deep4Net",
     "ShallowFBCSPNet":  "ShallowFBCSPNet",
     "EEG-TCNet":        "EEGTCNet",
-    "EEG-Transformer":  "EEGTransformer",
     "EEG Conformer":    "EEGConformer",
-    "Dual-TSST":        "DualTSST",
-    "EEGformer":        "EEGformer",
-    "MoCo-EEG":         "MoCoEEG",
-    "ST-TCNN":          "STTCNN",
 }
 
 BASELINE_MODELS = [
@@ -102,10 +87,6 @@ BASELINE_MODELS = [
     "ShallowFBCSPNet",
     "EEGTCNet",
     "EEGConformer",
-    "EEGTransformer",
-    "DualTSST",
-    "MoCoEEG",
-    "STTCNN",
 ]
 
 

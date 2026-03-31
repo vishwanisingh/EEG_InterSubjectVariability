@@ -32,7 +32,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from configs.config import DATA_DIR, WINDOWS_DIR, TASK
-from prepare_data import prepare_data
+from scripts.prepare_ccd_data import prepare_data
 
 
 # ── Release → OpenNeuro dataset ID map ───────────────────────────────────────

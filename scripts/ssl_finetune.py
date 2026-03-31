@@ -1,21 +1,21 @@
 """
 scripts/ssl_finetune.py
 -----------------------
-Fine-tuning script: loads a pretrained SSL encoder, attaches a regression
-head, and trains on CCD RT prediction.
+Fine-tuning script: loads a pretrained SSL encoder (EEGConformer or EEGTCNet
+backbone), attaches a regression head, and trains on CCD RT prediction.
 
 Also runs the critical ablation: the same encoder architecture trained
 from scratch (supervised) for a fair comparison.
 
 Usage:
-    # Fine-tune a pretrained VICReg encoder
-    python scripts/ssl_finetune.py --method vicreg --finetune_mode full
+    # Fine-tune a pretrained VICReg EEGConformer encoder
+    python scripts/ssl_finetune.py --method vicreg --encoder conformer --finetune_mode full
 
     # Fine-tune with frozen encoder (linear probe)
-    python scripts/ssl_finetune.py --method mae --finetune_mode linear
+    python scripts/ssl_finetune.py --method byol --encoder tcnet --finetune_mode linear
 
     # Run supervised-from-scratch baseline (same architecture)
-    python scripts/ssl_finetune.py --method supervised
+    python scripts/ssl_finetune.py --method supervised --encoder conformer
 """
 
 import sys
@@ -37,9 +37,8 @@ from configs.config import (
     VALID_FRAC, TEST_FRAC, SEED, EXCLUDED_SUBJECTS,
 )
 from src.data.disk_dataset import load_windowed_dataset
-from src.ssl.encoder import EEGEncoder
-from src.ssl.mae import EEGMaskedAutoencoder
-from src.ssl.finetune import FinetunedEEGModel, SupervisedEEGModel
+from src.ssl.encoder import create_encoder
+from src.ssl.finetune import FinetunedEEGModel
 from src.training.trainer import train_model
 from src.training.engine import validate_model
 from src.utils.device import setup_device
@@ -47,25 +46,30 @@ from src.utils.io import save_results_to_csv, save_model_weights
 from src.utils.plotting import plot_training_history
 
 
-def load_pretrained_encoder(method: str, embed_dim: int) -> EEGEncoder:
+def load_pretrained_encoder(
+    method: str,
+    encoder_name: str,
+    embed_dim: int,
+    n_chans: int,
+    n_times: int,
+):
     """Load pretrained encoder weights from disk."""
-    ckpt_path = WEIGHTS_DIR / f"ssl_{method}_encoder_best.pt"
+    run_name  = f"{method}_{encoder_name}"          # e.g. "vicreg_conformer"
+    ckpt_path = WEIGHTS_DIR / f"ssl_{run_name}_encoder_best.pt"
 
     if not ckpt_path.exists():
         raise FileNotFoundError(
             f"No pretrained encoder found at {ckpt_path}.\n"
-            f"Run: python scripts/ssl_pretrain.py --method {method}"
+            f"Run: python scripts/ssl_pretrain.py "
+            f"--method {method} --encoder {encoder_name}"
         )
 
-    # MAE uses a different encoder class
-    if method == "mae":
-        mae = EEGMaskedAutoencoder(n_chans=N_CHANS, n_times=N_TIMES,
-                                   encoder_d_model=embed_dim)
-        mae.encoder.load_state_dict(torch.load(ckpt_path, map_location="cpu"))
-        print(f"  ✓ Loaded pretrained MAE encoder from {ckpt_path}")
-        return mae.encoder
-
-    encoder = EEGEncoder(n_chans=N_CHANS, n_times=N_TIMES, embed_dim=embed_dim)
+    encoder = create_encoder(
+        name=encoder_name,
+        n_chans=n_chans,
+        n_times=n_times,
+        embed_dim=embed_dim,
+    )
     encoder.load_state_dict(torch.load(ckpt_path, map_location="cpu"))
     print(f"  ✓ Loaded pretrained encoder from {ckpt_path}")
     return encoder
@@ -73,6 +77,7 @@ def load_pretrained_encoder(method: str, embed_dim: int) -> EEGEncoder:
 
 def finetune(
     method: str = "vicreg",
+    encoder_name: str = "conformer",
     finetune_mode: str = "full",
     release: str = RELEASE,
     task: str = TASK,
@@ -116,31 +121,39 @@ def finetune(
     )
     print(f"  Train: {len(train_set)} | Valid: {len(valid_set)} | Test: {len(test_set)}")
 
-    train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True,  num_workers=NUM_WORKERS, drop_last=True)
+    train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True,  num_workers=NUM_WORKERS)
     valid_loader = DataLoader(valid_set, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS)
     test_loader  = DataLoader(test_set,  batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS)
 
     # ── [3/5] Build model ─────────────────────────────────────────────────────
-    print(f"\n[3/5] Building model (method={method}, mode={finetune_mode})")
+    print(f"\n[3/5] Building model  "
+          f"(encoder={encoder_name}, method={method}, finetune_mode={finetune_mode})")
 
     if method == "supervised":
-        # Critical ablation — same architecture, random init, supervised training
-        model = SupervisedEEGModel(
-            n_chans=N_CHANS, n_outputs=N_OUTPUTS, n_times=N_TIMES,
-            embed_dim=embed_dim, head_hidden=head_hidden,
+        # Critical ablation: same architecture, random init, trained with labels
+        encoder = create_encoder(
+            name=encoder_name,
+            n_chans=N_CHANS,
+            n_times=N_TIMES,
+            embed_dim=embed_dim,
         )
-        model_name = "SSL_Encoder_Supervised"
+        model_name = f"SSL_{encoder_name}_supervised"
     else:
-        # Load pretrained encoder + attach regression head
-        encoder = load_pretrained_encoder(method, embed_dim)
-        model   = FinetunedEEGModel(
-            encoder=encoder,
-            n_outputs=N_OUTPUTS,
-            finetune_mode=finetune_mode,
-            head_hidden=head_hidden,
+        encoder = load_pretrained_encoder(
+            method=method,
+            encoder_name=encoder_name,
+            embed_dim=embed_dim,
+            n_chans=N_CHANS,
+            n_times=N_TIMES,
         )
-        model_name = f"SSL_{method.upper()}_{finetune_mode}"
+        model_name = f"SSL_{method}_{encoder_name}_{finetune_mode}"
 
+    model = FinetunedEEGModel(
+        encoder=encoder,
+        n_outputs=N_OUTPUTS,
+        finetune_mode=finetune_mode if method != "supervised" else "full",
+        head_hidden=head_hidden,
+    )
     model.to(device)
     total     = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -162,7 +175,6 @@ def finetune(
     )
 
     # ── [5/5] Evaluate + save ─────────────────────────────────────────────────
-    # validate_model returns a dict: {avg_loss, rmse, mae, r2}
     test_metrics = validate_model(
         test_loader, model, torch.nn.MSELoss(), device, print_batch_stats=False
     )
@@ -173,9 +185,10 @@ def finetune(
     print(f"\n{'='*60}")
     print(f"RESULTS: {model_name}")
     print(f"  Best Val RMSE : {results['best_val_rmse']:.6f}  (epoch {results['best_epoch']})")
-    print(f"  Test RMSE     : {results['test_rmse']:.6f}  "
-          f"MAE: {results['test_mae']:.6f}  R2: {results['test_r2']:.4f}")
-    print("=" * 60)
+    print(f"  Test RMSE     : {results['test_rmse']:.6f}")
+    print(f"  Test MAE      : {results['test_mae']:.6f}")
+    print(f"  Test R2       : {results['test_r2']:.4f}")
+    print("="*60)
 
     save_results_to_csv(results, RESULTS_DIR / "ssl_results.csv", model_name=model_name)
     save_model_weights(results["best_model_state"], model_name, WEIGHTS_DIR)
@@ -188,7 +201,10 @@ def finetune(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="SSL Fine-tuning / Ablation")
     parser.add_argument("--method",        type=str, default="vicreg",
-                        choices=["vicreg", "byol", "mae", "supervised"])
+                        choices=["vicreg", "byol", "supervised"])
+    parser.add_argument("--encoder",       type=str, default="conformer",
+                        choices=["conformer", "tcnet"],
+                        help="Encoder backbone: 'conformer' or 'tcnet'")
     parser.add_argument("--finetune_mode", type=str, default="full",
                         choices=["full", "linear", "partial"])
     parser.add_argument("--release",       type=str, default=RELEASE)
@@ -200,6 +216,7 @@ if __name__ == "__main__":
 
     finetune(
         method=args.method,
+        encoder_name=args.encoder,
         finetune_mode=args.finetune_mode,
         release=args.release,
         task=args.task,
