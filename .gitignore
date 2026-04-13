@@ -1,7 +1,8 @@
 eeg/
-data/
+windows/
 __pycache__/
 .eegdash_cache/
 results/
 weights/
 *.pdf
+old_results/

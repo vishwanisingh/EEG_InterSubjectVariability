@@ -327,6 +327,11 @@ def evaluate(
     ss_res    = float(((t - p) ** 2).sum())
     ss_tot    = float(((t - t.mean()) ** 2).sum())
     r2        = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+    # NRMSE = RMSE / std(y_true) — scale-free, competition metric
+    # = sqrt(1 - R2) when computed on normalized targets
+    # A score of 1.0 = predicting the mean; lower is better
+    import math
+    nrmse     = math.sqrt(max(1.0 - r2, 0.0)) if not math.isnan(r2) else float("nan")
 
     p_sec = p * stats.rt_std + stats.rt_mean
     t_sec = t * stats.rt_std + stats.rt_mean
@@ -334,11 +339,12 @@ def evaluate(
     mae_sec  = float(torch.abs(p_sec - t_sec).mean())
 
     print(f"  [{label}]")
-    print(f"    Normalized   RMSE: {rmse_norm:.4f}  MAE: {mae_norm:.4f}  R2: {r2:.4f}")
-    print(f"    Denormalized RMSE: {rmse_sec:.4f} s  MAE: {mae_sec:.4f} s")
+    print(f"    NRMSE: {nrmse:.4f}  R2: {r2:.4f}  (competition metric: lower is better, 1.0 = predict mean)")
+    print(f"    RMSE : {rmse_sec:.4f} s  MAE: {mae_sec:.4f} s")
 
     return dict(
         rmse_norm=rmse_norm, mae_norm=mae_norm, r2=r2,
+        nrmse=nrmse,
         rmse_sec=rmse_sec,   mae_sec=mae_sec,
     )
 
@@ -448,6 +454,7 @@ def run_single_baseline(
             "Test RMSE":        ccd_m["rmse_sec"],
             "Test MAE":         ccd_m["mae_sec"],
             "Test R2":          ccd_m["r2"],
+            "Test NRMSE":       ccd_m["nrmse"],
             "Val RMSE":         val_rmse_sec,
             "Val MAE":          results["best_val_mae"] * stats.rt_std,
             "Val R2":           results["best_val_r2"],
@@ -457,6 +464,7 @@ def run_single_baseline(
             "Transfer RMSE":    transfer_m.get("rmse_sec",  float("nan")),
             "Transfer MAE":     transfer_m.get("mae_sec",   float("nan")),
             "Transfer R2":      transfer_m.get("r2",        float("nan")),
+            "Transfer NRMSE":   transfer_m.get("nrmse",     float("nan")),
             "Delta RMSE (s)":   (transfer_m.get("rmse_sec", float("nan"))
                                  - ccd_m["rmse_sec"]),
             "Delta R2":         delta_r2,

@@ -40,7 +40,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, ConcatDataset
 from sklearn.model_selection import train_test_split
 from sklearn.utils import check_random_state
 from scipy.signal import butter, sosfiltfilt
@@ -74,6 +74,17 @@ BASELINE_MODELS = [
     "EEGTCNet",
     "EEGConformer",
 ]
+
+RELEASE_MAP = {
+    "R1":  "ds005505", "R2":  "ds005506", "R3":  "ds005507",
+    "R4":  "ds005508", "R5":  "ds005509", "R6":  "ds005510",
+    "R7":  "ds005511", "R8":  "ds005512", "R9":  "ds005514",
+    "R10": "ds005515", "R11": "ds005516",
+}
+ALL_RELEASES     = list(RELEASE_MAP.keys())
+TRAIN_RELEASES   = ["R1","R2","R3","R4","R5","R6","R8","R9","R10"]
+VAL_RELEASES     = ["R11"]
+TEST_RELEASES    = ["R5"]
 
 ALL_NORM_METHODS = [
     "global_zscore",
@@ -183,6 +194,7 @@ class RiemannianParams(NormParams):
 def _collect_train_arrays(train_set) -> Tuple[np.ndarray, np.ndarray, List[str]]:
     """
     Load all training windows into RAM once.
+    Works with both EEGWindowDataset and ConcatDataset.
 
     Returns
     -------
@@ -190,17 +202,49 @@ def _collect_train_arrays(train_set) -> Tuple[np.ndarray, np.ndarray, List[str]]
     y        : float32 (N,)
     subjects : list[str] length N
     """
-    meta  = train_set.get_metadata()
-    N     = len(train_set)
-    X     = np.empty((N, N_CHANS, N_TIMES), dtype=np.float32)
-    y     = np.empty(N,                     dtype=np.float32)
-    sids  = meta["subject"].tolist()
+    from torch.utils.data import ConcatDataset as _ConcatDataset
+    import pandas as pd
 
-    print(f"  [norm-fit] Collecting {N} training windows into RAM…")
-    for i in range(N):
-        xi, yi = train_set[i]
-        X[i]   = xi.numpy()
-        y[i]   = yi.item()
+    N = len(train_set)
+    X = np.empty((N, N_CHANS, N_TIMES), dtype=np.float32)
+    y = np.empty(N,                     dtype=np.float32)
+
+    # Collect subject IDs — handle both EEGWindowDataset and ConcatDataset
+    if hasattr(train_set, "get_metadata"):
+        sids = train_set.get_metadata()["subject"].tolist()
+    elif isinstance(train_set, _ConcatDataset):
+        # Recursively gather metadata from each sub-dataset
+        frames = []
+        for ds in train_set.datasets:
+            if hasattr(ds, "get_metadata"):
+                frames.append(ds.get_metadata())
+        if frames:
+            sids = pd.concat(frames, ignore_index=True)["subject"].tolist()
+        else:
+            sids = ["unknown"] * N
+    else:
+        sids = ["unknown"] * N
+
+    # Sample up to max_windows to avoid OOM on large datasets
+    max_windows = 5000
+    if N > max_windows:
+        rng = np.random.default_rng(42)
+        idx = rng.choice(N, max_windows, replace=False)
+        print(f"  [norm-fit] Sampling {max_windows}/{N} windows for norm fitting…")
+    else:
+        idx = np.arange(N)
+        print(f"  [norm-fit] Collecting {N} training windows into RAM…")
+
+    M = len(idx)
+    X = X[:M]
+    y = y[:M]
+    sids = [sids[i] for i in idx] if sids[0] != "unknown" else sids[:M]
+
+    for j, i in enumerate(idx):
+        item = train_set[int(i)]
+        xi, yi = item[0], item[1]
+        X[j] = xi.numpy()
+        y[j] = yi.item()
 
     return X, y, sids
 
@@ -411,7 +455,7 @@ class NormalisedDataset(Dataset):
         return len(self.base)
 
     def __getitem__(self, idx: int):
-        x, y   = self.base[idx]
+        x, y, _ = self.base[idx]
         x_norm = apply_norm(x.numpy(), self.params, self.sids[idx])
         rt_n   = ((y.item() - self.params.rt_mean)
                   / (self.params.rt_std + 1e-8))
@@ -420,8 +464,19 @@ class NormalisedDataset(Dataset):
 
 
 def _sid_list(dataset) -> List[str]:
-    """Return one subject-ID string per window."""
-    return dataset.get_metadata()["subject"].tolist()
+    """Return one subject-ID string per window. Handles ConcatDataset."""
+    from torch.utils.data import ConcatDataset as _ConcatDataset
+    import pandas as pd
+    if hasattr(dataset, "get_metadata"):
+        return dataset.get_metadata()["subject"].tolist()
+    elif isinstance(dataset, _ConcatDataset):
+        frames = []
+        for ds in dataset.datasets:
+            if hasattr(ds, "get_metadata"):
+                frames.append(ds.get_metadata())
+        if frames:
+            return pd.concat(frames, ignore_index=True)["subject"].tolist()
+    return ["unknown"] * len(dataset)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -429,25 +484,37 @@ def _sid_list(dataset) -> List[str]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def train(
-    model_name:  str        = "BDTCN",
-    norm_method: str        = "global_zscore",
-    print_stats: bool       = True,
-    results_csv: Path       = None,
+    model_name:     str        = "BDTCN",
+    norm_method:    str        = "global_zscore",
+    print_stats:    bool       = True,
+    results_csv:    Path       = None,
+    train_releases: List[str]  = None,
+    val_releases:   List[str]  = None,
+    test_releases:  List[str]  = None,
 ) -> Dict:
     """
     Full training pipeline for one (model, norm_method) combination.
 
     Parameters
     ----------
-    model_name  : any key in MODEL_REGISTRY
-    norm_method : one of ALL_NORM_METHODS
-    print_stats : verbose epoch logging
-    results_csv : override output CSV path (default: RESULTS_DIR/results.csv)
+    model_name     : any key in MODEL_REGISTRY
+    norm_method    : one of ALL_NORM_METHODS
+    print_stats    : verbose epoch logging
+    results_csv    : override output CSV path (default: RESULTS_DIR/results.csv)
+    train_releases : list of release labels to train on (default: TRAIN_RELEASES)
+    val_releases   : list of release labels for validation (default: VAL_RELEASES)
+    test_releases  : list of release labels for test (default: TEST_RELEASES)
 
     Returns
     -------
     dict with all training and test metrics
     """
+    if train_releases is None:
+        train_releases = TRAIN_RELEASES
+    if val_releases is None:
+        val_releases = VAL_RELEASES
+    if test_releases is None:
+        test_releases = TEST_RELEASES
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     WEIGHTS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -465,36 +532,42 @@ def train(
     tag    = f"{norm_method}__{model_name}"
     device = setup_device()
 
-    root_dir = WINDOWS_DIR / f"{TASK}_{RELEASE}"
-
     # ── [1/6] Load dataset ────────────────────────────────────────────────────
-    print(f"\n[1/6] Loading windowed dataset from {root_dir}")
-    dataset = load_windowed_dataset(
-        root_dir=root_dir,
-        target_key="target",
-        eager=False,
-        excluded_subjects=EXCLUDED_SUBJECTS,
-    )
+    print(f"\n[1/6] Loading datasets")
+    print(f"  Train releases : {train_releases}")
+    print(f"  Val   releases : {val_releases}")
+    print(f"  Test  releases : {test_releases}")
 
-    # ── [2/6] Split by subjects ───────────────────────────────────────────────
-    print("\n[2/6] Splitting by subjects…")
-    all_subjects = dataset.get_subject_ids()
+    def _load_releases(releases, label):
+        datasets = []
+        for rel in releases:
+            root = WINDOWS_DIR / f"{TASK}_{rel}"
+            if not root.exists():
+                print(f"  [skip] {TASK}_{rel} not found")
+                continue
+            try:
+                ds = load_windowed_dataset(
+                    root_dir=root,
+                    target_key="target",
+                    eager=False,
+                    excluded_subjects=EXCLUDED_SUBJECTS,
+                )
+                datasets.append(ds)
+                print(f"  {label} {rel}: {len(ds)} windows, {len(ds.get_subject_ids())} subjects")
+            except Exception as e:
+                print(f"  [skip] {rel}: {e}")
+        if not datasets:
+            raise RuntimeError(f"No data found for {label} releases {releases}")
+        return datasets[0] if len(datasets) == 1 else ConcatDataset(datasets)
 
-    train_valid, test_subj = train_test_split(
-        all_subjects, test_size=TEST_FRAC,
-        random_state=check_random_state(SEED), shuffle=True,
-    )
-    adjusted_valid = VALID_FRAC / (1.0 - TEST_FRAC)
-    train_subj, valid_subj = train_test_split(
-        train_valid, test_size=adjusted_valid,
-        random_state=check_random_state(SEED + 1), shuffle=True,
-    )
-    train_set, valid_set, test_set = dataset.split_by_subjects(
-        train_subj, valid_subj, test_subj
-    )
-    print(f"  Train : {len(train_subj)} subjects  |  {len(train_set)} windows")
-    print(f"  Valid : {len(valid_subj)} subjects  |  {len(valid_set)} windows")
-    print(f"  Test  : {len(test_subj)} subjects  |  {len(test_set)} windows")
+    # ── [2/6] Split ───────────────────────────────────────────────────────────
+    print("\n[2/6] Building splits…")
+    train_set = _load_releases(train_releases, "train")
+    valid_set = _load_releases(val_releases,   "val  ")
+    test_set  = _load_releases(test_releases,  "test ")
+    print(f"  Train : {len(train_set)} windows")
+    print(f"  Valid : {len(valid_set)} windows")
+    print(f"  Test  : {len(test_set)} windows")
 
     # ── [3/6] Fit normalisation ───────────────────────────────────────────────
     print(f"\n[3/6] Fitting normalisation: {norm_method}")
@@ -547,21 +620,29 @@ def train(
         test_loader, model, torch.nn.MSELoss(), device,
         print_batch_stats=False,
     )
-    results["test_rmse"] = test_metrics["rmse"]
-    results["test_mae"]  = test_metrics["mae"]
-    results["test_r2"]   = test_metrics["r2"]
-    results["norm_method"] = norm_method
-    results["model_name"]  = model_name
+    # Denormalize RMSE and MAE back to seconds (multiply by rt_std only —
+    # RMSE/MAE measure spread, not location, so rt_mean is not added back)
+    rt_std  = norm_params.rt_std
+    rt_mean = norm_params.rt_mean
+    import math as _math
+    results["test_rmse"]     = test_metrics["rmse"] * rt_std   # seconds
+    results["test_mae"]      = test_metrics["mae"]  * rt_std   # seconds
+    results["test_r2"]       = test_metrics["r2"]              # unitless
+    results["test_nrmse"]    = _math.sqrt(max(1.0 - test_metrics["r2"], 0.0)) if not _math.isnan(test_metrics["r2"]) else float("nan")
+    results["val_rmse_sec"]  = results["best_val_rmse"] * rt_std
+    results["val_mae_sec"]   = results["best_val_mae"]  * rt_std
+    results["val_nrmse"]     = _math.sqrt(max(1.0 - results["best_val_r2"], 0.0)) if not _math.isnan(results["best_val_r2"]) else float("nan")
+    results["rt_mean_train"] = rt_mean
+    results["rt_std_train"]  = rt_std
+    results["norm_method"]   = norm_method
+    results["model_name"]    = model_name
 
     print(f"\n{'='*60}")
     print(f"RESULTS  [{tag}]")
-    print(f"  Val  RMSE : {results['best_val_rmse']:.6f}  "
-          f"MAE : {results['best_val_mae']:.6f}  "
-          f"R²  : {results['best_val_r2']:.4f}  "
-          f"(epoch {results['best_epoch']})")
-    print(f"  Test RMSE : {results['test_rmse']:.6f}  "
-          f"MAE : {results['test_mae']:.6f}  "
-          f"R²  : {results['test_r2']:.4f}")
+    print(f"  RT stats   : mean={rt_mean:.4f}s  std={rt_std:.4f}s")
+    print(f"  Val  NRMSE : {results['val_nrmse']:.4f}  RMSE: {results['val_rmse_sec']:.4f}s  R2: {results['best_val_r2']:.4f}  (epoch {results['best_epoch']})")
+    print(f"  Test NRMSE : {results['test_nrmse']:.4f}  RMSE: {results['test_rmse']:.4f}s  R2: {results['test_r2']:.4f}")
+    print(f"  (competition metric: NRMSE lower is better, 1.0 = predict mean)")
     print("=" * 60)
 
     # ── Save ──────────────────────────────────────────────────────────────────
@@ -581,12 +662,19 @@ def train(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_ablation(
-    norm_methods: List[str],
-    model_names:  List[str],
+    norm_methods:   List[str],
+    model_names:    List[str],
+    train_releases: List[str] = None,
+    val_releases:   List[str] = None,
+    test_releases:  List[str] = None,
 ) -> None:
     """Train every (norm_method, model) combination and print a summary."""
-    norm_methods = [NORM_ALIASES.get(m, m) for m in norm_methods]
-    results_csv  = RESULTS_DIR / "normalization_ablation.csv"
+    norm_methods   = [NORM_ALIASES.get(m, m) for m in norm_methods]
+    train_releases = train_releases or TRAIN_RELEASES
+    val_releases   = val_releases   or VAL_RELEASES
+    test_releases  = test_releases  or TEST_RELEASES
+    split_tag      = f"tr{'_'.join(train_releases)}_val{'_'.join(val_releases)}_te{'_'.join(test_releases)}"
+    results_csv    = RESULTS_DIR / f"normalization_ablation_{split_tag}.csv"
 
     total = len(norm_methods) * len(model_names)
     print(f"\n{'='*70}")
@@ -605,8 +693,11 @@ def run_ablation(
                 r = train(
                     model_name=model_name,
                     norm_method=norm_method,
-                    print_stats=False,       # keep output compact
+                    print_stats=False,
                     results_csv=results_csv,
+                    train_releases=train_releases,
+                    val_releases=val_releases,
+                    test_releases=test_releases,
                 )
                 all_results.append(r)
             except Exception as e:
@@ -677,19 +768,42 @@ if __name__ == "__main__":
         ),
     )
 
+    parser.add_argument(
+        "--train_releases", type=str, default=",".join(TRAIN_RELEASES),
+        help=f"Comma-separated train releases (default: {','.join(TRAIN_RELEASES)})"
+    )
+    parser.add_argument(
+        "--val_releases", type=str, default=",".join(VAL_RELEASES),
+        help=f"Comma-separated val releases (default: {','.join(VAL_RELEASES)})"
+    )
+    parser.add_argument(
+        "--test_releases", type=str, default=",".join(TEST_RELEASES),
+        help=f"Comma-separated test releases (default: {','.join(TEST_RELEASES)})"
+    )
+
     args = parser.parse_args()
 
+    train_rels = args.train_releases.split(",")
+    val_rels   = args.val_releases.split(",")
+    test_rels  = args.test_releases.split(",")
+
     if args.ablation:
-        # Full ablation: requested norms × requested models
         norm_list = args.norm if args.norm != ["global_zscore"] else ALL_NORM_METHODS
-        run_ablation(norm_methods=norm_list, model_names=args.models)
+        run_ablation(
+            norm_methods=norm_list, model_names=args.models,
+            train_releases=train_rels, val_releases=val_rels, test_releases=test_rels,
+        )
 
     elif args.run_baselines:
-        # All baseline models with one norm method
-        norm = args.norm[0]                  # take the first if multiple given
-        run_ablation(norm_methods=[norm], model_names=args.models)
+        norm = args.norm[0]
+        run_ablation(
+            norm_methods=[norm], model_names=args.models,
+            train_releases=train_rels, val_releases=val_rels, test_releases=test_rels,
+        )
 
     else:
-        # Single run — original behaviour, now with norm param
         norm = args.norm[0]
-        train(model_name=args.model, norm_method=norm, print_stats=True)
+        train(
+            model_name=args.model, norm_method=norm, print_stats=True,
+            train_releases=train_rels, val_releases=val_rels, test_releases=test_rels,
+        )
