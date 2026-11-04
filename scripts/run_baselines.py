@@ -52,10 +52,34 @@ from src.utils.plotting import plot_training_history
 ALL_RELEASES = ["R1", "R2", "R3", "R4", "R5", "R6", "R8", "R9", "R10", "R11"]
 TEST_RELEASE = "R5"
 
-# Models that need a smaller batch size due to attention memory cost
-BATCH_SIZE_OVERRIDES = {
-    "EEGformer": 8,
-    "DualTSST":  16,
+def set_seed(seed: int = SEED) -> None:
+    """Seed everything for reproducible weight init and data ordering."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark     = False
+
+
+# ── Baseline models (Stage 1 — five maximally different architectures) ────────
+BASELINE_MODELS = [
+    "AttentionBaseNet",
+    "ShallowFBCSPNet",
+    "EEGNet",
+    "EEGConformer",
+    "EEGTCNet",
+    "Deep4Net",
+]
+
+TRAIN_TASK = "contrastChangeDetection"
+
+# Release → OpenNeuro dataset ID map
+RELEASE_MAP = {
+    "R1":  "ds005505", "R2":  "ds005506", "R3":  "ds005507",
+    "R4":  "ds005508", "R5":  "ds005509", "R6":  "ds005510",
+    "R7":  "ds005511", "R8":  "ds005512", "R9":  "ds005514",
+    "R10": "ds005515", "R11": "ds005516",
 }
 
 # ── Shared config dicts ───────────────────────────────────────────────────────
@@ -111,13 +135,113 @@ def load_release(
         return None
 
 
-def make_loaders(train_set, valid_set, test_set, batch_size: int) -> tuple:
-    g = torch.Generator()
-    g.manual_seed(SEED)
-    train_loader = DataLoader(
-        train_set, batch_size=batch_size, shuffle=True,
-        num_workers=NUM_WORKERS, drop_last=True,
-        worker_init_fn=seed_worker, generator=g,
+class RobustNormStats:
+    """
+    Per-channel EEG robust stats (median/IQR) and scalar RT stats.
+    Uses median and IQR instead of mean/std — resistant to outliers.
+    Estimated from up to max_windows sampled training windows.
+    CCD training stats applied identically to transfer tasks.
+    """
+
+    def __init__(
+        self,
+        train_dataset,
+        normalize_eeg: bool = True,
+        normalize_rt: bool = True,
+        max_windows: int = 5000,
+        eps: float = 1e-6,
+    ):
+        self.normalize_eeg = normalize_eeg
+        self.normalize_rt  = normalize_rt
+
+        # Identity defaults
+        self.eeg_mean = np.zeros(N_CHANS, dtype=np.float32)
+        self.eeg_std  = np.ones(N_CHANS,  dtype=np.float32)
+        self.rt_mean  = 0.0
+        self.rt_std   = 1.0
+
+        if not normalize_eeg and not normalize_rt:
+            print(f"  [RobustNormStats] Both disabled — identity transform")
+            return
+
+        print(f"  [RobustNormStats] Estimating from up to {max_windows} windows ...")
+        n   = min(max_windows, len(train_dataset))
+        idx = np.random.default_rng(SEED).choice(len(train_dataset), n, replace=False)
+
+        eeg_windows = []
+        rt_vals     = []
+
+        for i in idx:
+            item = train_dataset[int(i)]
+            x, y = item[0], item[1]
+            eeg_windows.append(x.numpy())
+            if not np.isnan(y.item()):
+                rt_vals.append(y.item())
+
+        if normalize_eeg:
+            # Stack → (N, C, T) → reshape to (N*T, C) for per-channel stats
+            X   = np.stack(eeg_windows)             # (N, C, T)
+            Xt  = X.transpose(0, 2, 1).reshape(-1, N_CHANS)  # (N*T, C)
+            self.eeg_mean = np.median(Xt, axis=0).astype(np.float32)
+            iqr = (np.percentile(Xt, 75, axis=0)
+                   - np.percentile(Xt, 25, axis=0)).clip(min=eps)
+            self.eeg_std  = iqr.astype(np.float32)
+            print(f"  [RobustNormStats] EEG robust ON  — "
+                  f"IQR range [{self.eeg_std.min():.4f}, {self.eeg_std.max():.4f}]")
+        else:
+            print(f"  [RobustNormStats] EEG normalization OFF")
+
+        if normalize_rt:
+            rt_arr       = np.array(rt_vals, dtype=np.float64)
+            self.rt_mean = float(np.median(rt_arr))
+            rt_iqr       = float(np.percentile(rt_arr, 75) - np.percentile(rt_arr, 25))
+            self.rt_std  = max(rt_iqr, eps)
+            print(f"  [RobustNormStats] RT  robust ON  — median={self.rt_mean:.4f}  IQR={self.rt_std:.4f}")
+        else:
+            print(f"  [RobustNormStats] RT  normalization OFF")
+
+
+class NormalizedDataset(Dataset):
+    """
+    Wraps EEGWindowDataset with on-the-fly z-score normalization.
+    Always use the NormStats from the training split.
+    When normalization is disabled the NormStats identity values
+    (mean=0, std=1) make this a no-op transform.
+    """
+
+    def __init__(self, dataset, stats: NormStats):
+        self.dataset   = dataset
+        self.stats     = stats
+        self._eeg_mean = torch.from_numpy(stats.eeg_mean).unsqueeze(1)  # (C,1)
+        self._eeg_std  = torch.from_numpy(stats.eeg_std).unsqueeze(1)   # (C,1)
+        self._rt_mean  = stats.rt_mean
+        self._rt_std   = stats.rt_std
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        item   = self.dataset[idx]
+        x, y   = item[0], item[1]   # safe unpack
+        x_norm = (x - self._eeg_mean) / self._eeg_std
+        y_norm = (y - self._rt_mean)  / self._rt_std
+        return x_norm, y_norm
+
+    def denormalize(self, y_norm: torch.Tensor) -> torch.Tensor:
+        return y_norm * self._rt_std + self._rt_mean
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Split helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def subject_split(dataset: EEGWindowDataset, seed: int = SEED):
+    """80:10:10 random subject-level split."""
+    subjects = dataset.get_subject_ids()
+
+    train_valid, test_subj = train_test_split(
+        subjects, test_size=0.10,
+        random_state=check_random_state(seed), shuffle=True,
     )
     valid_loader = DataLoader(
         valid_set, batch_size=batch_size, shuffle=False,
@@ -323,6 +447,118 @@ def main(
     print(f"  Normalize EEG      : {normalize_eeg}")
     print("=" * 70)
 
+    device = setup_device()
+
+    transfer_task = args.transfer_task  # e.g. "symbolSearch" or "none"
+    do_transfer   = transfer_task.lower() != "none"
+
+    # ── [1] Load / split CCD ─────────────────────────────────────────────────
+    print(f"\n{'='*70}")
+    print(f"BASELINE TRAINING")
+    print(f"  Train task     : {TRAIN_TASK}")
+    print(f"  Transfer task  : {transfer_task if do_transfer else 'none'}")
+    print(f"  Split mode     : {args.split_mode}")
+    norm_label = (
+        f"EEG={'z-score per channel' if args.normalize_eeg else 'raw (no normalization)'} | "
+        f"RT={'z-score' if args.normalize_rt else 'raw (no normalization)'}"
+    )
+    print(f"  Normalization  : {norm_label}")
+    print('='*70)
+
+    print(f"\n[1/5] Loading and splitting {TRAIN_TASK}")
+
+    if args.split_mode == "subject":
+        # Load single release, split by subjects 80:10:10
+        root = WINDOWS_DIR / f"{TRAIN_TASK}_{args.release}"
+        ccd  = load_windowed_dataset(
+            root_dir=root, target_key="target",
+            eager=True, excluded_subjects=EXCLUDED_SUBJECTS,
+        )
+        print(f"  Loaded {len(ccd)} windows, "
+              f"{len(ccd.get_subject_ids())} subjects from {args.release}")
+        train_set, valid_set, ccd_test_set = subject_split(ccd)
+        split_label = f"subject_{args.release}"
+
+    else:  # release-wise
+        train_rels = args.train_releases.split(",")
+        val_rels   = args.val_releases.split(",")
+        test_rels  = args.test_releases.split(",")
+        train_set, valid_set, ccd_test_set = release_split(
+            TRAIN_TASK, train_rels, val_rels, test_rels
+        )
+        split_label = f"release_tr{'_'.join(train_rels)}_te{'_'.join(test_rels)}"
+
+    # ── [2] Normalization stats (training split only) ─────────────────────────
+    print(f"\n[2/5] Computing normalization statistics ({args.norm_method})")
+    if args.norm_method == "robust":
+        stats = RobustNormStats(
+            train_set,
+            normalize_eeg=args.normalize_eeg,
+            normalize_rt=args.normalize_rt,
+            max_windows=5000,
+        )
+    else:
+        stats = NormStats(
+            train_set,
+            normalize_eeg=args.normalize_eeg,
+            normalize_rt=args.normalize_rt,
+            max_windows=5000,
+        )
+
+    # ── [3] Wrap with normalization ───────────────────────────────────────────
+    print(f"\n[3/5] Applying normalization")
+    norm_train    = NormalizedDataset(train_set,    stats)
+    norm_valid    = NormalizedDataset(valid_set,    stats)
+    norm_ccd_test = NormalizedDataset(ccd_test_set, stats)
+
+    train_loader    = DataLoader(norm_train,    batch_size=BATCH_SIZE,
+                                 shuffle=True,  num_workers=NUM_WORKERS, drop_last=True)
+    valid_loader    = DataLoader(norm_valid,    batch_size=BATCH_SIZE,
+                                 shuffle=False, num_workers=NUM_WORKERS)
+    ccd_test_loader = DataLoader(norm_ccd_test, batch_size=BATCH_SIZE,
+                                 shuffle=False, num_workers=NUM_WORKERS)
+
+    # ── [4] Load transfer task ────────────────────────────────────────────────
+    transfer_loader = None
+    if do_transfer:
+        print(f"\n[4/5] Loading transfer task: {transfer_task}")
+        # For release-wise split, use the first test release for transfer
+        transfer_rel = None
+        for rel in ["R1", "R2", "R3", "R4", "R5", "R6", "R7", "R8", "R9", "R10", "R11"]:
+            candidate = WINDOWS_DIR / f"{transfer_task}_{rel}"
+            if candidate.exists():
+                # Check it actually has valid subjects
+                subj_file = candidate / "subjects.txt"
+                if subj_file.exists() and len(subj_file.read_text().strip().splitlines()) > 0:
+                    transfer_rel = rel
+                    break
+        if transfer_rel is None:
+            raise FileNotFoundError(f"No valid windowed data found for {transfer_task}")
+        print(f"  Using {transfer_task}_{transfer_rel} for transfer evaluation")
+        transfer_ds = load_transfer_dataset(transfer_task, transfer_rel)
+        norm_transfer   = NormalizedDataset(transfer_ds, stats)  # CCD train stats
+        transfer_loader = DataLoader(norm_transfer, batch_size=BATCH_SIZE,
+                                     shuffle=False, num_workers=NUM_WORKERS)
+    else:
+        print(f"\n[4/5] No transfer task requested")
+
+    # ── [5] Train all baselines ───────────────────────────────────────────────
+    if args.models:
+        requested = [m.strip() for m in args.models.split(",")]
+        unknown   = [m for m in requested if m not in BASELINE_MODELS]
+        if unknown:
+            print(f"[ERROR] Unknown model(s): {unknown}")
+            print(f"        Available: {BASELINE_MODELS}")
+            sys.exit(1)
+        models_to_run = requested
+    else:
+        models_to_run = BASELINE_MODELS
+
+    print(f"\n[5/5] Training {len(models_to_run)} model(s): {models_to_run}")
+    results_csv = RESULTS_DIR / f"baseline_results_{split_label}.csv"
+    all_results = {}
+
+    # Global seed before the loop — individual models re-seed inside run_single_baseline
     set_seed(SEED)
     device = setup_device()
     tag    = run_only or "all_models"
@@ -393,6 +629,13 @@ if __name__ == "__main__":
         "--model", type=str, default=None,
         help="Run a single model by name (e.g. --model EEGConformer). Omit to run all.",
     )
+    parser.add_argument(
+        "--norm_method", type=str, default="global_zscore",
+        choices=["global_zscore", "robust"],
+        help="Normalization method: global_zscore (default) or robust (median/IQR). "
+             "Both apply CCD training stats to transfer tasks."
+    )
+
     args = parser.parse_args()
     main(
         data_mode=args.data_mode,
