@@ -1,68 +1,67 @@
-# EEG Regression — Repository Structure
+# EEG Reaction-Time Prediction
 
-```
-eeg_project/
-│
-├── configs/                   # All configuration lives here
-│   ├── config.py              # Paths, hyperparameters, global constants
-│   ├── task_configs.py        # Per-task preprocessing settings (anchor, target, etc.)
-│   └── __init__.py
-│
-├── src/                       # Importable source package
-│   ├── data/
-│   │   ├── loader.py          # load_eegdash_dataset, load_challenge_dataset, preprocess_dataset
-│   │   ├── windowing.py       # create_windows
-│   │   └── splitting.py       # split_by_subjects
-│   │
-│   ├── models/
-│   │   ├── registry.py        # create_model(), MODEL_REGISTRY, get_baseline_models()
-│   │   ├── eeg_unified.py     # EEGUnifiedModel (custom backbone)
-│   │   ├── moe.py             # SimpleMoE, MoE, MoEConfig
-│   │   ├── mlp.py             # MLP building block
-│   │   └── multi_temporal_kernels.py   # MultiKernelConv1d
-│   │
-│   ├── training/
-│   │   ├── engine.py          # train_one_epoch, validate_model
-│   │   └── trainer.py         # train_model (with early stopping)
-│   │
-│   └── utils/
-│       ├── io.py              # save_results_to_csv, save_model_weights
-│       ├── plotting.py        # plot_training_history, plot_response_time_distribution
-│       └── device.py          # setup_device
-│
-├── scripts/                   # Runnable entry points
-│   ├── prepare_data.py        # Step 1: download → preprocess → window → save to disk
-│   ├── train.py               # Step 2: load from disk → train one model
-│   └── run_baselines.py       # Step 2 (alt): train all baseline models sequentially
-│
-└── data/
-    └── windows/               # Saved windowed datasets (created by prepare_data.py)
-```
+This repository prepares HBN EEG windows and trains regression models to predict
+reaction time. The pipeline is organized by lifecycle stage; Python entry points
+live in `scripts/`, reusable code lives in `src/`, and shell launchers live in
+`bash/`.
 
-## Workflow
+## Pipeline Stages
+
+### 1. Prepare data
+
+Use the task-specific preparation entry point:
 
 ```bash
-# Step 1 — run ONCE (or when you change task / dataset)
-python scripts/prepare_data.py
-
-# Step 2 — run as many times as needed
-python scripts/train.py          # single model
-python scripts/run_baselines.py  # all baselines
+python scripts/prepare_ccd_data.py
+python scripts/prepare_ss_data.py
+python scripts/prepare_sl_data.py
 ```
 
-## Switching tasks
+For multi-release CCD preparation, use `scripts/prepare_all_releases.py`. The
+release-aware shell pipelines (`bash/ccd_pipeline.sh`, `bash/ss_pipeline.sh`,
+and `bash/sl_pipeline.sh`) additionally handle HPC upload, verification, and
+local cleanup. They accept `--releases`, `--skip`, `--keep_local`, and
+`--dry_run` options.
 
-Edit `configs/config.py`:
-```python
-TASK       = "surroundSupp"     # any key in configs/task_configs.py
-DATASET_ID = "ds005509"
+Run the data pipeline from the project root, for example:
+
+```bash
+bash bash/ccd_pipeline.sh --dry_run --releases R5
 ```
 
-Then re-run `prepare_data.py` once for the new task.
+### 2. Train and evaluate
 
-## Switching models
+```bash
+# Train one model / run a normalization experiment
+python scripts/train.py --help
 
-In `scripts/train.py`, change the last line:
-```python
-train(model_name="EEGNet")   # any key in src/models/registry.MODEL_REGISTRY
+# Compare baseline models; defaults to subject split and Symbol Search transfer
+python scripts/run_baselines.py --help
+
+# Baselines only, no transfer evaluation
+python scripts/run_baselines.py --transfer_task none
 ```
+
+The Slurm launchers `bash/run_ablation.sh`, `bash/run_ablation_all.sh`, and
+`bash/run_transfer.sh` wrap the training entry points. Submit them from the
+project root so Slurm writes logs under the repository's `logs/` directory.
+`bash/run_pipeline.sh` is the general baseline launcher. Specialized SSL work
+is started with `bash/run_ssl_pretrain_multirelease.sh`.
+
+### 3. Outputs
+
+Prepared windows are stored under `data/windows/`; experiment tables and plots
+under `results/`; model checkpoints under `weights/`; and run logs under `logs/`.
+
+## Code Map
+
+- `configs/`: dataset, task, and training configuration.
+- `bash/`: local and Slurm shell launchers.
+- `scripts/`: data preparation, training, transfer, and analysis entry points.
+- `src/data/`, `src/models/`, `src/training/`, `src/utils/`: reusable pipeline
+    components.
+- `data/`, `results/`, `weights/`, `logs/`: generated inputs and outputs.
+
+Task preprocessing settings are in `configs/task_config.py`. Baseline model
+selection is in `scripts/run_baselines.py` and model construction is in
+`src/models/registry.py`.
